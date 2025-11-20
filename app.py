@@ -1560,17 +1560,17 @@ with gr.Blocks(
                         examples_sos = gr.Examples(examples=[[f] for f in sos_files], inputs=[in_img], examples_per_page=len(sos_files) or 1)
 
             with gr.Accordion("Examples", open=False, visible=False) as shelf_examples_accordion:
-                shelf_examples = gr.Examples(examples=[[f] for f in da_files], inputs=[shelf_in_img], examples_per_page=len(da_files) or 1)
+                with gr.Tabs() as shelf_examples_tabs:
+                    with gr.Tab("DA") as shelf_examples_da_tab:
+                        shelf_examples_da = gr.Examples(examples=[[f] for f in da_files], inputs=[shelf_in_img], examples_per_page=len(da_files) or 1)
+                    with gr.Tab("ShareOfShelf") as shelf_examples_sos_tab:
+                        shelf_examples_sos = gr.Examples(examples=[[f] for f in sos_files], inputs=[shelf_in_img], examples_per_page=len(sos_files) or 1)
 
             with gr.Accordion("Examples", open=False, visible=False) as category_examples_accordion:
                 category_examples = gr.Examples(examples=[[f] for f in da_files], inputs=[category_in_img], examples_per_page=len(da_files) or 1)
 
             with gr.Accordion("Examples", open=False, visible=False) as fixed_examples_accordion:
-                with gr.Tabs() as fixed_examples_tabs:
-                    with gr.Tab("DA") as fixed_examples_da_tab:
-                        fixed_examples_da = gr.Examples(examples=[[f] for f in da_files], inputs=[fixed_in_img], examples_per_page=len(da_files) or 1)
-                    with gr.Tab("ShareOfShelf") as fixed_examples_sos_tab:
-                        fixed_examples_sos = gr.Examples(examples=[[f] for f in sos_files], inputs=[fixed_in_img], examples_per_page=len(sos_files) or 1)
+                fixed_examples = gr.Examples(examples=[[f] for f in da_files], inputs=[fixed_in_img], examples_per_page=len(da_files) or 1)
 
     # Wire functions
     model_selector.change(fn=select_model, inputs=model_selector, outputs=[model_status, class_filter])
