@@ -1532,7 +1532,7 @@ with gr.Blocks(
                 category_conf = gr.Slider(0.01, 0.99, value=0.25, step=0.01, label="Confidence Threshold")
 
             with gr.Accordion("Fixed Shelf Settings", open=True, visible=False) as fixed_settings_accordion:
-                fixed_shelftalker_conf = gr.Slider(0.01, 0.99, value=0.25, step=0.01, label="Shelftalker Confidence")
+                fixed_shelftalker_conf = gr.Slider(0.01, 0.99, value=0.15, step=0.01, label="Shelftalker Confidence")
                 fixed_ubl_conf = gr.Slider(0.01, 0.99, value=0.25, step=0.01, label="UBL Product Confidence")
                 fixed_expand_margin = gr.Slider(0.0, 0.3, value=0.05, step=0.01, label="ROI Tightness (lower = tighter)")
 
@@ -1566,7 +1566,11 @@ with gr.Blocks(
                 category_examples = gr.Examples(examples=[[f] for f in da_files], inputs=[category_in_img], examples_per_page=len(da_files) or 1)
 
             with gr.Accordion("Examples", open=False, visible=False) as fixed_examples_accordion:
-                fixed_examples = gr.Examples(examples=[[f] for f in da_files], inputs=[fixed_in_img], examples_per_page=len(da_files) or 1)
+                with gr.Tabs() as fixed_examples_tabs:
+                    with gr.Tab("DA") as fixed_examples_da_tab:
+                        fixed_examples_da = gr.Examples(examples=[[f] for f in da_files], inputs=[fixed_in_img], examples_per_page=len(da_files) or 1)
+                    with gr.Tab("ShareOfShelf") as fixed_examples_sos_tab:
+                        fixed_examples_sos = gr.Examples(examples=[[f] for f in sos_files], inputs=[fixed_in_img], examples_per_page=len(sos_files) or 1)
 
     # Wire functions
     model_selector.change(fn=select_model, inputs=model_selector, outputs=[model_status, class_filter])
