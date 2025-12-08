@@ -13,7 +13,7 @@ import cv2
 from PIL import Image
 from ultralytics import YOLO
 from gradio.themes.utils import colors
-from typing import List, Tuple, Optional
+from typing import List, Tuple, Optional, Dict
 from collections import defaultdict
 
 # Import category analysis functions and constants
@@ -44,6 +44,21 @@ except ImportError as e:
     print(f"⚠️ Product clustering not available: {e}")
     PRODUCT_CLUSTERING_AVAILABLE = False
     detect_shelves_from_products = None
+
+# Import size variant detector (simple version)
+try:
+    from size_variant_detector_simple import (
+        assign_size_variants_simple,
+        get_size_summary,
+        format_summary_text
+    )
+    SIZE_VARIANT_DETECTOR_AVAILABLE = True
+except ImportError as e:
+    print(f"⚠️ Size variant detector not available: {e}")
+    SIZE_VARIANT_DETECTOR_AVAILABLE = False
+    assign_size_variants_simple = None
+    get_size_summary = None
+    format_summary_text = None
 
 
 
@@ -1112,9 +1127,99 @@ def run_category_analysis(image: Image.Image, conf: float):
     return result_pil, metrics_text
 
 
+def _draw_detections_with_size_variants(
+    image: Image.Image,
+    detections: List[Dict],
+    show_labels: bool = True,
+    show_conf: bool = True
+) -> Image.Image:
+    """
+    Draw detection bounding boxes with size variant information.
+
+    Args:
+        image: Input PIL Image
+        detections: List of detection dicts with bbox_xyxy, class_name, confidence, size_variant
+        show_labels: Whether to show labels
+        show_conf: Whether to show confidence scores
+
+    Returns:
+        Annotated PIL Image
+    """
+    # Convert PIL to OpenCV format
+    image_np = np.array(image)
+    image_bgr = cv2.cvtColor(image_np, cv2.COLOR_RGB2BGR)
+    img_draw = image_bgr.copy()
+
+    # Color palette (using different colors for different classes)
+    colors = [
+        (255, 0, 0), (0, 255, 0), (0, 0, 255), (255, 255, 0),
+        (255, 0, 255), (0, 255, 255), (128, 0, 0), (0, 128, 0),
+        (0, 0, 128), (128, 128, 0), (128, 0, 128), (0, 128, 128)
+    ]
+
+    # Group by class for color assignment
+    class_to_color = {}
+    color_idx = 0
+
+    for det in detections:
+        class_name = det.get("class_name", "unknown")
+        if class_name not in class_to_color:
+            class_to_color[class_name] = colors[color_idx % len(colors)]
+            color_idx += 1
+
+    # Draw each detection
+    for det in detections:
+        x1, y1, x2, y2 = map(int, det["bbox_xyxy"])
+        class_name = det.get("class_name", "unknown")
+        confidence = det.get("confidence", 0.0)
+        size_variant = det.get("size_variant", "")
+
+        color = class_to_color[class_name]
+
+        # Draw bounding box
+        cv2.rectangle(img_draw, (x1, y1), (x2, y2), color, 2)
+
+        # Build label text
+        if show_labels:
+            label_parts = []
+
+            # Add class name and size variant
+            if size_variant and size_variant != "unknown":
+                label_parts.append(f"{class_name} ({size_variant})")
+            else:
+                label_parts.append(class_name)
+
+            # Add confidence
+            if show_conf:
+                label_parts.append(f"{confidence:.2f}")
+
+            label = " ".join(label_parts)
+
+            # Get label size for background
+            font = cv2.FONT_HERSHEY_SIMPLEX
+            font_scale = 0.5
+            thickness = 1
+            (label_w, label_h), baseline = cv2.getTextSize(label, font, font_scale, thickness)
+
+            # Draw label background
+            cv2.rectangle(img_draw,
+                         (x1, y1 - label_h - baseline - 5),
+                         (x1 + label_w, y1),
+                         color, -1)
+
+            # Draw label text
+            cv2.putText(img_draw, label,
+                       (x1, y1 - baseline - 3),
+                       font, font_scale, (255, 255, 255), thickness)
+
+    # Convert back to RGB for PIL
+    result_rgb = cv2.cvtColor(img_draw, cv2.COLOR_BGR2RGB)
+    return Image.fromarray(result_rgb)
+
+
 # Run YOLO inference on a PIL image and return annotated image, detections, and optional YOLO TXT lines
 def _run_yolo_on_pil(image: Image.Image, conf: float, iou: float, imgsz: int, selected_classes: Optional[List[str]] = None, want_yolo_boxes: bool = False,
-                     include_conf: bool = False, show_labels: bool = True, show_conf: bool = True) -> Tuple[Image.Image, dict, Optional[List[str]]]:
+                     include_conf: bool = False, show_labels: bool = True, show_conf: bool = True, detect_size_variants: bool = False) -> Tuple[Image.Image, dict, Optional[List[str]]]:
 
     # Save PIL image to temporary file to match annotate.py preprocessing
     # This ensures identical results between app.py and annotate.py
@@ -1162,17 +1267,37 @@ def _run_yolo_on_pil(image: Image.Image, conf: float, iou: float, imgsz: int, se
                     "class_name": names.get(int(k), str(int(k)))
                 })
 
+    # Apply size variant detection if enabled and available
+    detection_json = {"detections": dets}
+    if detect_size_variants and SIZE_VARIANT_DETECTOR_AVAILABLE and dets:
+        # Use simple ratio-based detection
+        enriched_detections = assign_size_variants_simple(dets)
+        size_summary = get_size_summary(enriched_detections)
+        summary_text = format_summary_text(size_summary)
+
+        detection_json = {
+            "detections": enriched_detections,
+            "size_summary": size_summary,
+            "summary": summary_text,
+            "total_detections": len(enriched_detections)
+        }
+
     # Optionally create YOLO-format TXT lines
     yolo_lines = _yolo_box_txt(r, include_conf=include_conf) if want_yolo_boxes else None
 
     # Create annotated image for visualization
-    # Note: r.plot() returns BGR numpy array (OpenCV format)
-    annotated_bgr = r.plot(labels=show_labels, conf=show_conf, line_width=2)
-    annotated_rgb = cv2.cvtColor(annotated_bgr, cv2.COLOR_BGR2RGB)
-    annotated_pil = Image.fromarray(annotated_rgb)
+    if detect_size_variants and SIZE_VARIANT_DETECTOR_AVAILABLE and dets:
+        # Draw custom annotations with size variants
+        annotated_pil = _draw_detections_with_size_variants(image, detection_json["detections"], show_labels, show_conf)
+    else:
+        # Use default YOLO plot
+        # Note: r.plot() returns BGR numpy array (OpenCV format)
+        annotated_bgr = r.plot(labels=show_labels, conf=show_conf, line_width=2)
+        annotated_rgb = cv2.cvtColor(annotated_bgr, cv2.COLOR_BGR2RGB)
+        annotated_pil = Image.fromarray(annotated_rgb)
 
     # Return annotated image, detections JSON, and YOLO TXT lines
-    return annotated_pil, {"detections": dets}, yolo_lines
+    return annotated_pil, detection_json, yolo_lines
 
 
 
@@ -1207,13 +1332,13 @@ def _save_results_zip(annotated_img: Image.Image, dets: dict, yolo_lines: Option
 
 
 # Run detection on a single uploaded image and return annotated preview, JSON, and ZIP
-def ui_predict_single(image: Image.Image, conf: float, iou: float, imgsz: int, class_filter: List[str], export_fmt: str, include_conf: bool, show_labels: bool, show_conf: bool):
+def ui_predict_single(image: Image.Image, conf: float, iou: float, imgsz: int, class_filter: List[str], export_fmt: str, include_conf: bool, show_labels: bool, show_conf: bool, detect_size_variants: bool):
     if image is None:
         raise gr.Error("🖼️ Please upload an image.")  # handle empty input
 
     want_yolo = (export_fmt == "YOLO TXT")  # check export format choice
     # Run YOLO inference and get annotated image + detections + optional YOLO TXT lines
-    annotated, dets, yolo_lines = _run_yolo_on_pil(image, conf, iou, imgsz, class_filter or None, want_yolo_boxes=want_yolo, include_conf=include_conf, show_labels=show_labels, show_conf=show_conf)
+    annotated, dets, yolo_lines = _run_yolo_on_pil(image, conf, iou, imgsz, class_filter or None, want_yolo_boxes=want_yolo, include_conf=include_conf, show_labels=show_labels, show_conf=show_conf, detect_size_variants=detect_size_variants)
 
     # Save results (image + JSON or YOLO TXT) into a ZIP for download
     zip_path = _save_results_zip(annotated, dets, yolo_lines=yolo_lines if want_yolo else None, base_name="image")
@@ -1226,7 +1351,7 @@ def ui_predict_single(image: Image.Image, conf: float, iou: float, imgsz: int, c
 
 
 # Run YOLO inference on multiple uploaded images and return gallery, combined JSON, and ZIP
-def ui_predict_batch(files: List[gr.File], conf: float, iou: float, imgsz: int, class_filter: List[str], export_fmt: str, include_conf: bool, show_labels: bool, show_conf: bool):
+def ui_predict_batch(files: List[gr.File], conf: float, iou: float, imgsz: int, class_filter: List[str], export_fmt: str, include_conf: bool, show_labels: bool, show_conf: bool, detect_size_variants: bool):
     if not files:
         raise gr.Error("🗂️ Please upload one or more images.")  # handle empty batch
 
@@ -1249,7 +1374,7 @@ def ui_predict_batch(files: List[gr.File], conf: float, iou: float, imgsz: int, 
         fname = os.path.basename(fpath)
 
         # Run YOLO model and get detections
-        annotated, dets, yolo_lines = _run_yolo_on_pil(img, conf, iou, imgsz, class_filter or None, want_yolo_boxes=want_yolo, include_conf=include_conf, show_labels=show_labels, show_conf=show_conf)
+        annotated, dets, yolo_lines = _run_yolo_on_pil(img, conf, iou, imgsz, class_filter or None, want_yolo_boxes=want_yolo, include_conf=include_conf, show_labels=show_labels, show_conf=show_conf, detect_size_variants=detect_size_variants)
 
         # Show directly in the Gallery
         gallery_outputs.append((annotated, fname))
@@ -1506,6 +1631,13 @@ with gr.Blocks(
                     show_labels = gr.Checkbox(label="Show Labels", value=True)
                     show_conf = gr.Checkbox(label="Show Confidence", value=True)
 
+                gr.Markdown("**Size Variant Detection**")
+                detect_size_variants = gr.Checkbox(
+                    label="Detect Product Size Variants",
+                    value=False,
+                    info="Analyze bounding box dimensions to identify size variants (e.g., 500g vs 1kg)"
+                )
+
             with gr.Accordion("Class Filter", open=False, visible=True) as class_filter_accordion:
                 class_filter = gr.CheckboxGroup(label="Filter Classes (Optional)", choices=[], value=[])
 
@@ -1574,10 +1706,10 @@ with gr.Blocks(
 
     # Wire functions
     model_selector.change(fn=select_model, inputs=model_selector, outputs=[model_status, class_filter])
-    run_btn.click(fn=ui_predict_single, inputs=[in_img, conf, iou, imgsz, class_filter, export_fmt, include_conf, show_labels, show_conf], outputs=[out_img, out_json, out_zip])
+    run_btn.click(fn=ui_predict_single, inputs=[in_img, conf, iou, imgsz, class_filter, export_fmt, include_conf, show_labels, show_conf, detect_size_variants], outputs=[out_img, out_json, out_zip])
     clear_btn.click(fn=lambda: (gr.update(value=None), None, "", None), inputs=None, outputs=[in_img, out_img, out_json, out_zip])
 
-    run_batch_btn.click(fn=ui_predict_batch, inputs=[in_files, conf, iou, imgsz, class_filter, export_fmt, include_conf, show_labels, show_conf],
+    run_batch_btn.click(fn=ui_predict_batch, inputs=[in_files, conf, iou, imgsz, class_filter, export_fmt, include_conf, show_labels, show_conf, detect_size_variants],
                         outputs=[out_gallery, out_batch_json, out_batch_zip])
     clear_batch_btn.click(fn=lambda: (gr.update(value=None), None, "", None), inputs=None, outputs=[in_files, out_gallery, out_batch_json, out_batch_zip])
 
