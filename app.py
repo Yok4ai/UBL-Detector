@@ -99,6 +99,9 @@ current_model_path = model_files[0]
 MODEL = YOLO(current_model_path)
 print(f"✅ Loaded model: {current_model_path}")
 
+# Cache for dynamically selected models (keeps re-loads fast)
+MODEL_CACHE: Dict[str, YOLO] = {}
+
 # Load models for shelf share analysis
 SKU110K_MODEL_PATH = os.path.join(MODEL_DIR, "SKU110k_YOLO11X.pt")
 UBL_MODEL_PATH = os.path.join(MODEL_DIR, "DA_YOLO11X.pt")
@@ -126,6 +129,12 @@ else:
     FIXED_SHELF_ANALYSIS_AVAILABLE = False
     print("⚠️ Shelftalker model not found. Fixed Shelf Analysis tab will be disabled.")
 
+# Default selections for Fixed Shelf tab
+DEFAULT_FIXED_PRODUCT_MODEL = os.path.basename(UBL_MODEL_PATH) if os.path.exists(UBL_MODEL_PATH) else os.path.basename(current_model_path)
+FIXED_CATEGORY_CHOICES = [("All Categories", "all")]
+for key, label in CATEGORY_DISPLAY_NAMES.items():
+    FIXED_CATEGORY_CHOICES.append((label, key))
+
 # Function to reload the model dynamically
 def select_model(model_name):
     global MODEL
@@ -133,6 +142,22 @@ def select_model(model_name):
     MODEL = YOLO(model_path)
     print(f"🔁 Switched to model: {model_name}")
     return (f"**Active model:** {model_name}", gr.update(choices=_class_names(), value=[]))
+
+
+def _resolve_model_path(model_name_or_path: str) -> str:
+    """Resolve a model reference to an absolute path inside the models directory when needed."""
+    if os.path.isabs(model_name_or_path):
+        return model_name_or_path
+    return os.path.abspath(os.path.join(MODEL_DIR, model_name_or_path))
+
+
+def get_cached_model(model_name_or_path: str) -> YOLO:
+    """Load a YOLO model with simple caching to avoid reloading on every call."""
+    abs_path = _resolve_model_path(model_name_or_path)
+    if abs_path not in MODEL_CACHE:
+        MODEL_CACHE[abs_path] = YOLO(abs_path)
+        print(f"✅ Loaded model for fixed analysis: {abs_path}")
+    return MODEL_CACHE[abs_path]
 
 
 
@@ -739,7 +764,8 @@ def detect_shelftalker_rois(
 def detect_ubl_in_rois(
     image: Image.Image,
     rois: List[Tuple[List[float], dict]],
-    conf: float
+    conf: float,
+    product_model: YOLO
 ) -> Tuple[List[dict], List[dict]]:
     """
     Detect UBL products within shelftalker ROIs.
@@ -775,7 +801,7 @@ def detect_ubl_in_rois(
 
         try:
             # Detect UBL products in this ROI
-            results = UBL_MODEL(temp_path, conf=conf, verbose=False)[0]
+            results = product_model(temp_path, conf=conf, verbose=False)[0]
             boxes = results.boxes.xyxy.cpu().numpy() if results.boxes is not None else np.array([])
             scores = results.boxes.conf.cpu().numpy() if results.boxes is not None else np.array([])
             class_ids = results.boxes.cls.cpu().numpy().astype(int) if results.boxes is not None else np.array([])
@@ -794,7 +820,7 @@ def detect_ubl_in_rois(
             x2_global = box[2] + x_offset
             y2_global = box[3] + y_offset
 
-            class_name = UBL_MODEL.names.get(class_id, str(class_id))
+            class_name = product_model.names.get(class_id, str(class_id))
             product_classes[class_name] += 1
 
             detection = {
@@ -802,6 +828,7 @@ def detect_ubl_in_rois(
                 'score': float(score),
                 'class_id': int(class_id),
                 'class_name': class_name,
+                'category': CATEGORY_MAPPING.get(class_name, 'unknown'),
                 'roi_index': roi_idx
             }
 
@@ -821,6 +848,167 @@ def detect_ubl_in_rois(
         roi_summaries.append(summary)
 
     return all_detections, roi_summaries
+
+
+def _filter_roi_summaries_by_category(
+    roi_summaries: List[dict],
+    selected_category: str
+) -> Tuple[List[dict], List[dict]]:
+    """Filter detections and summaries down to a specific category (or keep all)."""
+    filtered_detections: List[dict] = []
+    filtered_summaries: List[dict] = []
+
+    for summary in roi_summaries:
+        category_dets = []
+        product_breakdown = defaultdict(int)
+
+        for det in summary.get('detections', []):
+            category = det.get('category', CATEGORY_MAPPING.get(det.get('class_name', ''), 'unknown'))
+            if selected_category != "all" and category != selected_category:
+                continue
+            category_dets.append(det)
+            product_breakdown[det.get('class_name', 'unknown')] += 1
+
+        new_summary = dict(summary)
+        new_summary['detections'] = category_dets
+        new_summary['total_products'] = len(category_dets)
+        new_summary['product_breakdown'] = dict(product_breakdown)
+        filtered_summaries.append(new_summary)
+        filtered_detections.extend(category_dets)
+
+    return filtered_detections, filtered_summaries
+
+
+def _filter_isolated_detections(detections: List[dict], max_neighbor_distance: float) -> List[dict]:
+    """Remove detections that are too far from their nearest neighbor."""
+    if len(detections) < 2:
+        return []
+
+    centers = np.array([
+        ((det['box'][0] + det['box'][2]) / 2.0, (det['box'][1] + det['box'][3]) / 2.0)
+        for det in detections
+    ])
+
+    keep_indices = []
+    for idx, center in enumerate(centers):
+        others = np.delete(centers, idx, axis=0)
+        if len(others) == 0:
+            continue
+        nearest = np.min(np.linalg.norm(others - center, axis=1))
+        if nearest <= max_neighbor_distance:
+            keep_indices.append(idx)
+
+    return [detections[i] for i in keep_indices]
+
+
+def run_fixed_shelf_fallback_clustering(
+    image: Image.Image,
+    product_model: YOLO,
+    conf: float,
+    selected_category: str,
+    neighbor_distance_ratio: float = 0.12
+) -> Tuple[Image.Image, str]:
+    """Fallback when no shelftalkers are found: detect, filter by category, and drop isolated items."""
+    # Save image for consistent preprocessing
+    temp_file = tempfile.NamedTemporaryFile(suffix='.jpg', delete=False)
+    temp_path = temp_file.name
+    temp_file.close()
+    image.save(temp_path, quality=95)
+
+    try:
+        results = product_model(temp_path, conf=conf, verbose=False)[0]
+        boxes = results.boxes.xyxy.cpu().numpy() if results.boxes is not None else np.array([])
+        scores = results.boxes.conf.cpu().numpy() if results.boxes is not None else np.array([])
+        class_ids = results.boxes.cls.cpu().numpy().astype(int) if results.boxes is not None else np.array([])
+    finally:
+        if os.path.exists(temp_path):
+            os.remove(temp_path)
+
+    detections = []
+    for box, score, class_id in zip(boxes, scores, class_ids):
+        class_name = product_model.names.get(int(class_id), str(int(class_id)))
+        category = CATEGORY_MAPPING.get(class_name, 'unknown')
+        detection = {
+            'box': [float(box[0]), float(box[1]), float(box[2]), float(box[3])],
+            'score': float(score),
+            'class_id': int(class_id),
+            'class_name': class_name,
+            'category': category
+        }
+        if selected_category == "all" or category == selected_category:
+            detections.append(detection)
+
+    if len(detections) == 0:
+        msg = {
+            "message": "No detections matched the selected category during fallback clustering",
+            "method": "fallback_clustering",
+            "selected_category": selected_category
+        }
+        return image, json.dumps(msg, indent=2)
+
+    max_neighbor_distance = max(image.width, image.height) * neighbor_distance_ratio
+    clustered = _filter_isolated_detections(detections, max_neighbor_distance)
+
+    if len(clustered) == 0:
+        msg = {
+            "message": "Detections were too isolated to keep after clustering filter",
+            "method": "fallback_clustering",
+            "selected_category": selected_category,
+            "max_neighbor_distance_px": round(max_neighbor_distance, 2)
+        }
+        return image, json.dumps(msg, indent=2)
+
+    category_detections = defaultdict(list)
+    product_breakdown = defaultdict(int)
+    for det in clustered:
+        category_detections[det['category']].append({
+            'box': np.array(det['box'], dtype=float),
+            'class_name': det['class_name'],
+            'confidence': det['score']
+        })
+        product_breakdown[det['class_name']] += 1
+
+    # Draw with product names on boxes (category color, class label)
+    image_np = np.array(image)
+    image_bgr = cv2.cvtColor(image_np, cv2.COLOR_RGB2BGR)
+    img_draw = image_bgr.copy()
+    for category, dets in category_detections.items():
+        color = CATEGORY_COLORS.get(category, (128, 128, 128))
+        for d in dets:
+            x1, y1, x2, y2 = map(int, d['box'])
+            cv2.rectangle(img_draw, (x1, y1), (x2, y2), color, 2)
+            label = d['class_name']
+            cv2.putText(img_draw, label, (x1, y1 - 5),
+                       cv2.FONT_HERSHEY_SIMPLEX, 0.5, color, 1)
+
+    result_rgb = cv2.cvtColor(img_draw, cv2.COLOR_BGR2RGB)
+    result_image = Image.fromarray(result_rgb)
+
+    category_counts = {cat: len(dets) for cat, dets in category_detections.items()}
+
+    metrics = {
+        "message": "No shelftalkers detected; used fallback clustering",
+        "method": "fallback_clustering",
+        "selected_category": selected_category,
+        "detections_before_neighbor_filter": len(detections),
+        "detections_after_neighbor_filter": len(clustered),
+        "max_neighbor_distance_px": round(max_neighbor_distance, 2),
+        "category_counts": {
+            CATEGORY_DISPLAY_NAMES.get(cat, cat): count for cat, count in category_counts.items()
+        },
+        "product_breakdown_by_class": dict(product_breakdown),
+        "detections": [
+            {
+                "class_name": det['class_name'],
+                "category": det['category'],
+                "confidence": det['score'],
+                "box_xyxy": det['box']
+            }
+            for det in clustered
+        ]
+    }
+
+    return result_image, json.dumps(metrics, indent=2)
 
 
 def calculate_planogram_adherence(roi_summaries: List[dict]) -> dict:
@@ -955,6 +1143,8 @@ def run_fixed_shelf_analysis(
     image: Image.Image,
     shelftalker_conf: float,
     ubl_conf: float,
+    product_model_name: str,
+    selected_category: str,
     expand_margin: float = 0.1,
     show_shelftalkers: bool = True,
     show_roi: bool = True,
@@ -987,35 +1177,41 @@ def run_fixed_shelf_analysis(
     if image is None:
         raise gr.Error("Please upload an image.")
 
+    if not product_model_name:
+        raise gr.Error("Please select a product model for fixed shelf analysis.")
+
+    product_model = get_cached_model(product_model_name)
+
     # Step 1: Detect all shelftalkers and combine into one planogram ROI
     print("🔍 Step 1: Detecting shelftalkers and creating planogram ROI...")
     rois, individual_shelftalkers = detect_shelftalker_rois(image, shelftalker_conf, expand_margin, combine_rois=True)
 
     if len(rois) == 0:
-        print("⚠️ No shelftalkers detected")
-        return image, json.dumps({
-            "message": "No shelftalkers detected in the image",
-            "total_fixed_shelves": 0
-        }, indent=2)
+        print("⚠️ No shelftalkers detected – using fallback clustering")
+        return run_fixed_shelf_fallback_clustering(image, product_model, ubl_conf, selected_category)
 
     print(f"   Found {len(individual_shelftalkers)} shelftalker(s), combined into planogram ROI")
 
     # Step 2: Detect UBL products within the combined planogram ROI
     print("📦 Step 2: Detecting UBL products within planogram ROI...")
-    all_detections, roi_summaries = detect_ubl_in_rois(image, rois, ubl_conf)
-    print(f"   Found {len(all_detections)} UBL product(s) in planogram area")
+    all_detections, roi_summaries = detect_ubl_in_rois(image, rois, ubl_conf, product_model)
+    print(f"   Found {len(all_detections)} product(s) in planogram area before category filter")
+
+    filtered_detections, filtered_roi_summaries = _filter_roi_summaries_by_category(roi_summaries, selected_category)
+    print(f"   {len(filtered_detections)} product(s) after applying category filter '{selected_category}'")
 
     # Step 3: Calculate planogram metrics
     print("📊 Step 3: Calculating planogram adherence...")
-    metrics = calculate_planogram_adherence(roi_summaries)
+    metrics = calculate_planogram_adherence(filtered_roi_summaries)
 
     # Update to reflect number of shelftalkers
     metrics['total_fixed_shelves'] = len(individual_shelftalkers)
+    metrics['selected_category'] = selected_category
 
     # Step 4: Create visualization
     print("🎨 Step 4: Creating visualization...")
     result_image = draw_fixed_shelf_results(
-        image, rois, individual_shelftalkers, all_detections, metrics,
+        image, rois, individual_shelftalkers, filtered_detections, metrics,
         show_shelftalkers=show_shelftalkers,
         show_roi=show_roi,
         show_products=show_products
@@ -1033,7 +1229,8 @@ def run_fixed_shelf_analysis(
                 'confidence': s['score']
             } for s in individual_shelftalkers
         ],
-        "product_breakdown": roi_summaries[0]['product_breakdown'] if roi_summaries else {}
+        "product_breakdown": filtered_roi_summaries[0]['product_breakdown'] if filtered_roi_summaries else {},
+        "selected_category": selected_category
     }
 
     metrics_text = json.dumps(output, indent=2)
@@ -1664,6 +1861,21 @@ with gr.Blocks(
                 category_conf = gr.Slider(0.01, 0.99, value=0.25, step=0.01, label="Confidence Threshold")
 
             with gr.Accordion("Fixed Shelf Settings", open=True, visible=False) as fixed_settings_accordion:
+                fixed_product_model = gr.Dropdown(
+                    label="Product Model",
+                    choices=[os.path.basename(m) for m in model_files],
+                    value=DEFAULT_FIXED_PRODUCT_MODEL,
+                    filterable=False,
+                    allow_custom_value=False,
+                    info="Model used for product detection inside the shelf (and fallback)"
+                )
+                fixed_category_selector = gr.Dropdown(
+                    label="Shelf Category",
+                    choices=FIXED_CATEGORY_CHOICES,
+                    value="all",
+                    interactive=True,
+                    info="Only count detections that map to this category"
+                )
                 fixed_shelftalker_conf = gr.Slider(0.01, 0.99, value=0.15, step=0.01, label="Shelftalker Confidence")
                 fixed_ubl_conf = gr.Slider(0.01, 0.99, value=0.25, step=0.01, label="UBL Product Confidence")
                 fixed_expand_margin = gr.Slider(0.0, 0.3, value=0.05, step=0.01, label="ROI Tightness (lower = tighter)")
@@ -1756,8 +1968,8 @@ with gr.Blocks(
     if FIXED_SHELF_ANALYSIS_AVAILABLE:
         fixed_run_btn.click(
             fn=run_fixed_shelf_analysis,
-            inputs=[fixed_in_img, fixed_shelftalker_conf, fixed_ubl_conf, fixed_expand_margin,
-                    fixed_show_shelftalkers, fixed_show_roi, fixed_show_products],
+            inputs=[fixed_in_img, fixed_shelftalker_conf, fixed_ubl_conf, fixed_product_model, fixed_category_selector,
+                fixed_expand_margin, fixed_show_shelftalkers, fixed_show_roi, fixed_show_products],
             outputs=[fixed_out_img, fixed_metrics]
         )
         fixed_clear_btn.click(fn=lambda: (gr.update(value=None), None, ""), inputs=None, outputs=[fixed_in_img, fixed_out_img, fixed_metrics])
