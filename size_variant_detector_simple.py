@@ -9,9 +9,24 @@ import numpy as np
 from typing import List, Dict
 from collections import defaultdict
 
+# Import product name mapping
+try:
+    from product_name_mapping import (
+        PRODUCT_SIZE_VARIANTS_CONFIG,
+        get_product_display_name,
+        get_default_size
+    )
+    PRODUCT_NAME_MAPPING_AVAILABLE = True
+except ImportError:
+    print("⚠️ Product name mapping not available, using class names")
+    PRODUCT_SIZE_VARIANTS_CONFIG = {}
+    get_product_display_name = lambda cn, sv=None: cn
+    get_default_size = lambda cn: 'N/A'
+    PRODUCT_NAME_MAPPING_AVAILABLE = False
+
 
 # Simple product size mapping - just names and relative sizes
-PRODUCT_SIZE_VARIANTS = {
+PRODUCT_SIZE_VARIANTS = PRODUCT_SIZE_VARIANTS_CONFIG if PRODUCT_SIZE_VARIANTS_CONFIG else {
     "horlicks_std": ["500g", "1kg"],  # Smaller to larger
     "horlicks_mother": ["350g"],
     "horlicks_women": ["400g"],
@@ -54,15 +69,21 @@ def assign_size_variants_simple(detections: List[Dict]) -> List[Dict]:
         variants = PRODUCT_SIZE_VARIANTS.get(class_name, None)
 
         if variants is None or len(variants) == 0:
-            # No variants configured - skip size detection
+            # No variants configured - skip size detection but still add product name
             for idx, _ in items:
                 enriched[idx]["size_variant"] = "N/A"
+                # Still add human-readable product name even without size variants
+                if PRODUCT_NAME_MAPPING_AVAILABLE:
+                    enriched[idx]["product_name"] = get_product_display_name(class_name, None)
             continue
 
         if len(variants) == 1:
             # Only one size exists - assign to all
             for idx, _ in items:
                 enriched[idx]["size_variant"] = variants[0]
+                # Add human-readable product name
+                if PRODUCT_NAME_MAPPING_AVAILABLE:
+                    enriched[idx]["product_name"] = get_product_display_name(class_name, variants[0])
             continue
 
         # Multiple variants - cluster by height
@@ -70,9 +91,13 @@ def assign_size_variants_simple(detections: List[Dict]) -> List[Dict]:
         heights_sorted = sorted(heights, key=lambda x: x[1])
 
         if len(heights) == 1:
-            # Single detection - assume it's the larger variant
+            # Single detection - use default size (most common variant)
             idx = heights[0][0]
-            enriched[idx]["size_variant"] = variants[-1]  # Largest size
+            default_size = get_default_size(class_name) if PRODUCT_NAME_MAPPING_AVAILABLE else variants[0]
+            enriched[idx]["size_variant"] = default_size
+            # Add human-readable product name
+            if PRODUCT_NAME_MAPPING_AVAILABLE:
+                enriched[idx]["product_name"] = get_product_display_name(class_name, default_size)
             continue
 
         # Multiple detections - split into groups
@@ -113,6 +138,19 @@ def assign_size_variants_simple(detections: List[Dict]) -> List[Dict]:
             size = variants[variant_idx]
             for idx, _ in cluster:
                 enriched[idx]["size_variant"] = size
+                # Add human-readable product name
+                if PRODUCT_NAME_MAPPING_AVAILABLE:
+                    enriched[idx]["product_name"] = get_product_display_name(class_name, size)
+
+    # Safety check: ensure all detections have size_variant and product_name
+    for idx, det in enumerate(enriched):
+        if "size_variant" not in det:
+            class_name = det.get("class_name", "unknown")
+            # Assign default size
+            default_size = get_default_size(class_name) if PRODUCT_NAME_MAPPING_AVAILABLE else "N/A"
+            enriched[idx]["size_variant"] = default_size
+            if PRODUCT_NAME_MAPPING_AVAILABLE:
+                enriched[idx]["product_name"] = get_product_display_name(class_name, default_size)
 
     return enriched
 
@@ -122,19 +160,25 @@ def get_size_summary(detections: List[Dict]) -> Dict[str, Dict[str, int]]:
     Create a clean summary of size variant counts.
 
     Returns:
-        Dict: {class_name: {size: count}}
+        Dict: {product_name: {size: count}}
     """
     summary = defaultdict(lambda: defaultdict(int))
 
     for det in detections:
-        class_name = det.get("class_name", "unknown")
+        # Use product_name if available, otherwise class_name
+        if PRODUCT_NAME_MAPPING_AVAILABLE and 'product_name' in det:
+            product_key = det['product_name']
+        else:
+            class_name = det.get("class_name", "unknown")
+            product_key = class_name
+            
         size = det.get("size_variant", "N/A")
 
         # Skip products without size variants
         if size == "N/A":
             continue
 
-        summary[class_name][size] += 1
+        summary[product_key][size] += 1
 
     return {k: dict(v) for k, v in summary.items()}
 
@@ -143,12 +187,12 @@ def format_summary_text(summary: Dict[str, Dict[str, int]]) -> List[str]:
     """
     Format summary as readable text lines.
 
-    Returns list of strings like: ["horlicks_std: 5x 1kg, 2x 500g"]
+    Returns list of strings like: ["STANDARD HORLICKS 500G JAR: 5x 1kg, 2x 500g"]
     """
     lines = []
-    for class_name, sizes in sorted(summary.items()):
+    for product_name, sizes in sorted(summary.items()):
         # Use 'x' instead of '×' to avoid unicode issues
         size_parts = [f"{count}x {size}" for size, count in sorted(sizes.items(), reverse=True)]
-        lines.append(f"{class_name}: {', '.join(size_parts)}")
+        lines.append(f"{product_name}: {', '.join(size_parts)}")
 
     return lines
